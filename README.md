@@ -18,6 +18,7 @@ bl add <text>   # add a task (or just `bl a` and type it)
 bl take <n>     # start a task
 bl done <n>     # finish a task
 bl available    # show what's free to grab
+bl run          # ask your AI agent to work the backlog
 bl purge        # archive finished tasks
 bl setup        # tell your AI agent about bl
 ```

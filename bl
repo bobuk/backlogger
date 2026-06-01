@@ -7,6 +7,7 @@
 
 import os
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -16,6 +17,7 @@ STATUS_EMPTY = " "
 STATUS_TAKEN = ">"
 STATUS_DONE = "x"
 BL_INSTRUCTION = "Use `bl` to manage the local backlog stored in `backlog.md`. Run `bl help` for available commands. If asked to review or implement new tasks, start with `bl v` to see available tasks."
+RUN_PROMPT = "go through the backlog and complete all tasks"
 CONFIG_DIR = os.path.expanduser("~/.config/bl")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
 DEFAULT_AGENT = "claude"
@@ -62,6 +64,7 @@ Commands:
   bl untake <line>        Mark a task as todo.
   bl done <line>          Mark a task as done.
   bl available            Show only tasks that are available to take.
+  bl run                  Ask the configured AI agent to execute the backlog.
   bl purge                Archive all completed tasks below the separator.
   bl install              Install bl into ~/.local/bin.
   bl setup                Add the bl instruction to AGENTS.md or CLAUDE.md.
@@ -315,6 +318,29 @@ def config_cmd(args):
     print(f"Set {key} = {value}")
 
 
+def run_agent():
+    config = read_config()
+    agent = config.get("agent", DEFAULT_AGENT)
+    match agent:
+        case "codex":
+            cmd = ["codex", "exec", RUN_PROMPT]
+        case "claude":
+            cmd = ["claude", "-p", RUN_PROMPT]
+        case "pi":
+            cmd = ["pi", "-p", RUN_PROMPT]
+        case _:
+            print(f"Invalid agent in config: {agent}")
+            print(f"Valid agents: {', '.join(VALID_AGENTS)}")
+            sys.exit(1)
+
+    try:
+        result = subprocess.run(cmd)
+    except FileNotFoundError:
+        print(f"Agent executable not found: {cmd[0]}")
+        sys.exit(1)
+    sys.exit(result.returncode)
+
+
 def _self_source():
     """Return the bl source code.
 
@@ -417,6 +443,8 @@ def main():
         set_status(n, STATUS_DONE)
     elif cmd in ("available", "v"):
         show_available()
+    elif cmd in ("run", "r"):
+        run_agent()
     elif cmd in ("purge", "p"):
         purge()
     elif cmd == "setup":
