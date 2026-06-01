@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Simple backlog manager. Reads/writes backlog.md in the current directory."""
+
+import os
+import re
+import sys
+import tomllib
+
+BACKLOG = "backlog.md"
+SEPARATOR = "---"
+STATUS_EMPTY = " "
+STATUS_TAKEN = ">"
+STATUS_DONE = "x"
+BL_INSTRUCTION = "Use `bl` to manage the local backlog stored in `backlog.md`. Run `bl help` for available commands. If asked to review or implement new tasks, start with `bl v` to see available tasks."
+CONFIG_DIR = os.path.expanduser("~/.config/bl")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
+DEFAULT_AGENT = "claude"
+VALID_AGENTS = ("codex", "claude", "pi")
+
+
+def read_backlog():
+    if not os.path.exists(BACKLOG):
+        return [], [], False
+    with open(BACKLOG, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == SEPARATOR:
+            return lines[:i], lines[i + 1 :], True
+    return lines, [], False
+
+
+def write_backlog(active, archive):
+    with open(BACKLOG, "w", encoding="utf-8") as f:
+        for line in active:
+            f.write(line + "\n")
+        if archive:
+            f.write(SEPARATOR + "\n")
+            for line in archive:
+                f.write(line + "\n")
+
+
+def show_help():
+    print("""Usage: bl [COMMAND] [ARGS...]
+
+A tiny backlog manager that operates on backlog.md in the current directory.
+
+Commands:
+  bl                      Show the backlog with line numbers.
+  bl add <text>           Add a new task (e.g. bl add fix login bug).
+  bl take <line>          Mark a task as in-progress.
+  bl untake <line>        Mark a task as todo.
+  bl done <line>          Mark a task as done.
+  bl available            Show only tasks that are available to take.
+  bl purge                Archive all completed tasks below the separator.
+  bl setup                Add the bl instruction to AGENTS.md or CLAUDE.md.
+  bl unsetup              Remove the bl instruction from AGENTS.md and CLAUDE.md.
+  bl config               Show configuration.
+  bl config agent         Show current agent.
+  bl config agent <name>  Set agent (codex, claude, pi).
+  bl help                 Show this help message.
+
+Status symbols:
+  [ ]  todo
+  [>]  in-progress
+  [x]  done
+
+File format (backlog.md):
+  The file is a plain Markdown list. Each task is a single line:
+
+    - [ ] Task description
+    - [>] Task in progress
+    - [x] Completed task
+
+  An optional archive section can be separated by a line containing
+  exactly three dashes:
+
+    - [ ] Active task
+    ---
+    - [x] Archived completed task
+
+  All commands except "purge" operate only on the active section
+  (everything above the --- separator). The "purge" command moves
+  all completed tasks from the active section into the archive.
+""")
+
+
+def show():
+    active, _, _ = read_backlog()
+    if not active:
+        print("(backlog is empty)")
+        return
+    for i, line in enumerate(active, start=1):
+        print(f"{i:3} {line}")
+
+
+def add(text):
+    active, archive, _ = read_backlog()
+    is_priority = "ASAP" in text or "FIX" in text
+    if is_priority:
+        has_in_progress = any(
+            re.search(r"^\s*-\s*\[>\]", line) for line in active
+        )
+        if has_in_progress:
+            print("Cannot add a priority task while there are in-progress tasks.")
+            sys.exit(1)
+        active.insert(0, f"- [ ] {text}")
+    else:
+        active.append(f"- [ ] {text}")
+    write_backlog(active, archive)
+    print(f"Added: {text}")
+
+
+def require_backlog():
+    if not os.path.exists(BACKLOG):
+        print(f"Error: {BACKLOG} does not exist in the current directory.")
+        print("Use 'bl add <text>' to create it.")
+        sys.exit(1)
+
+
+def set_status(line_no, status_char):
+    require_backlog()
+    active, archive, _ = read_backlog()
+    if not active:
+        print("backlog.md is empty")
+        sys.exit(1)
+    if line_no < 1 or line_no > len(active):
+        print(f"Line {line_no} does not exist (1-{len(active)})")
+        sys.exit(1)
+    idx = line_no - 1
+    old_line = active[idx]
+    new_line = re.sub(r"^(\s*-\s*\[)[^\]](\]\s*)", r"\1" + status_char + r"\2", old_line, count=1)
+    active[idx] = new_line
+    write_backlog(active, archive)
+    print(f"Updated line {line_no}")
+
+
+def show_available():
+    require_backlog()
+    active, _, _ = read_backlog()
+    found = False
+    for i, line in enumerate(active, start=1):
+        if re.search(r"^\s*-\s*\[\s\]", line):
+            print(f"{i:3} {line}")
+            found = True
+    if not found:
+        print("(no available tasks)")
+
+
+def purge():
+    require_backlog()
+    active, archive, _ = read_backlog()
+    done_tasks = []
+    remaining = []
+    for line in active:
+        if re.search(r"^\s*-\s*\[x\]", line):
+            done_tasks.append(line)
+        else:
+            remaining.append(line)
+    if not done_tasks:
+        print("(no completed tasks to archive)")
+        return
+    archive.extend(done_tasks)
+    write_backlog(remaining, archive)
+    print(f"Archived {len(done_tasks)} task(s)")
+
+
+def setup():
+    prefix = BL_INSTRUCTION[:15]
+    candidates = []
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        if os.path.exists(name):
+            candidates.append(name)
+
+    created = []
+    if not candidates:
+        print("No AGENTS.md or CLAUDE.md found in the current directory.")
+        try:
+            choice = input("Which file should be created? (agents/claude/none): ").strip().lower()
+        except EOFError:
+            print("No terminal input available. Run with a TTY or create the file manually.")
+            sys.exit(1)
+        if choice in ("agents", "a"):
+            candidates = ["AGENTS.md"]
+            created = ["AGENTS.md"]
+        elif choice in ("claude", "c"):
+            candidates = ["CLAUDE.md"]
+            created = ["CLAUDE.md"]
+        else:
+            print("Cancelled.")
+            return
+
+    for fname in candidates:
+        if fname in created:
+            lines = []
+        else:
+            with open(fname, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+        found_idx = None
+        for i, line in enumerate(lines):
+            if line.rstrip("\n").startswith(prefix):
+                found_idx = i
+                break
+
+        if found_idx is not None:
+            if lines[found_idx].rstrip("\n") == BL_INSTRUCTION:
+                print(f"Already configured in {fname}")
+                continue
+            else:
+                lines.pop(found_idx)
+                print(f"Updated instruction in {fname}")
+
+        if lines and not lines[-1].endswith("\n"):
+            lines.append("\n")
+        lines.append(BL_INSTRUCTION + "\n")
+
+        with open(fname, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        if found_idx is None:
+            print(f"Updated {fname}")
+
+
+def unsetup():
+    prefix = BL_INSTRUCTION[:15]
+    removed = False
+    for fname in ("AGENTS.md", "CLAUDE.md"):
+        if not os.path.exists(fname):
+            continue
+        with open(fname, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        new_lines = []
+        for line in lines:
+            if line.rstrip("\n").startswith(prefix):
+                removed = True
+                continue
+            new_lines.append(line)
+        if len(new_lines) != len(lines):
+            with open(fname, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+            print(f"Removed from {fname}")
+    if not removed:
+        print("No setup found in AGENTS.md or CLAUDE.md.")
+
+
+def read_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {"agent": DEFAULT_AGENT}
+    with open(CONFIG_FILE, "rb") as f:
+        config = tomllib.load(f)
+    if "agent" not in config:
+        config["agent"] = DEFAULT_AGENT
+    return config
+
+
+def write_config(config):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        for key, value in config.items():
+            if isinstance(value, str):
+                f.write(f'{key} = "{value}"\n')
+            else:
+                f.write(f"{key} = {value}\n")
+
+
+def show_config():
+    config = read_config()
+    for key, value in config.items():
+        print(f"{key} = {value}")
+
+
+def config_cmd(args):
+    config = read_config()
+    if not args:
+        show_config()
+        return
+    key = args[0]
+    if key != "agent":
+        print(f"Unknown config key: {key}")
+        print(f"Available keys: agent ({', '.join(VALID_AGENTS)})")
+        sys.exit(1)
+    if len(args) == 1:
+        print(config.get(key, DEFAULT_AGENT))
+        return
+    value = args[1]
+    if value not in VALID_AGENTS:
+        print(f"Invalid agent: {value}")
+        print(f"Valid agents: {', '.join(VALID_AGENTS)}")
+        sys.exit(1)
+    config[key] = value
+    write_config(config)
+    print(f"Set {key} = {value}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        show()
+        return
+
+    cmd = args[0]
+
+    if cmd in ("add", "a"):
+        if len(args) < 2:
+            print("Usage: bl add <text>")
+            sys.exit(1)
+        add(" ".join(args[1:]))
+    elif cmd in ("take", "t"):
+        if len(args) != 2:
+            print("Usage: bl take <line_number>")
+            sys.exit(1)
+        try:
+            n = int(args[1])
+        except ValueError:
+            print("Line number must be an integer")
+            sys.exit(1)
+        set_status(n, STATUS_TAKEN)
+    elif cmd in ("untake", "u"):
+        if len(args) != 2:
+            print("Usage: bl untake <line_number>")
+            sys.exit(1)
+        try:
+            n = int(args[1])
+        except ValueError:
+            print("Line number must be an integer")
+            sys.exit(1)
+        set_status(n, STATUS_EMPTY)
+    elif cmd in ("done", "d"):
+        if len(args) != 2:
+            print("Usage: bl done <line_number>")
+            sys.exit(1)
+        try:
+            n = int(args[1])
+        except ValueError:
+            print("Line number must be an integer")
+            sys.exit(1)
+        set_status(n, STATUS_DONE)
+    elif cmd in ("available", "v"):
+        show_available()
+    elif cmd in ("purge", "p"):
+        purge()
+    elif cmd == "setup":
+        setup()
+    elif cmd == "unsetup":
+        unsetup()
+    elif cmd == "config":
+        config_cmd(args[1:])
+    elif cmd in ("help", "-h", "--help"):
+        show_help()
+    else:
+        print(f"Unknown command: {cmd}\n")
+        show_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
