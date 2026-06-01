@@ -20,8 +20,12 @@ CONFIG_DIR = os.path.expanduser("~/.config/bl")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
 DEFAULT_AGENT = "claude"
 VALID_AGENTS = ("codex", "claude", "pi")
-INSTALL_DIR = os.path.expanduser("~/.local/bin")
-INSTALL_PATH = os.path.join(INSTALL_DIR, "bl")
+INSTALL_CANDIDATES = [
+    os.path.expanduser("~/.local/bin"),
+    os.path.expanduser("~/bin"),
+    os.path.expanduser("~/.bin"),
+]
+DEFAULT_INSTALL_DIR = INSTALL_CANDIDATES[0]
 REPO_RAW_URL = "https://raw.githubusercontent.com/bobuk/backlogger/main/bl"
 
 
@@ -333,17 +337,27 @@ def _self_source():
         sys.exit(1)
 
 
+def _choose_install_dir():
+    # Prefer a common bin dir that's already on PATH so install just works.
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    for cand in INSTALL_CANDIDATES:
+        if cand in path_dirs:
+            return cand, True
+    return DEFAULT_INSTALL_DIR, False
+
+
 def install():
     source = _self_source()
-    os.makedirs(INSTALL_DIR, exist_ok=True)
-    with open(INSTALL_PATH, "w", encoding="utf-8") as f:
+    install_dir, on_path = _choose_install_dir()
+    install_path = os.path.join(install_dir, "bl")
+    os.makedirs(install_dir, exist_ok=True)
+    with open(install_path, "w", encoding="utf-8") as f:
         f.write(source)
-    os.chmod(INSTALL_PATH, 0o755)
-    print(f"Installed bl to {INSTALL_PATH}")
-    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
-    if INSTALL_DIR not in path_dirs:
-        print(f"Note: {INSTALL_DIR} is not in your PATH.")
-        print(f'  Add it with: export PATH="{INSTALL_DIR}:$PATH"')
+    os.chmod(install_path, 0o755)
+    print(f"Installed bl to {install_path}")
+    if not on_path:
+        print(f"Note: {install_dir} is not in your PATH.")
+        print(f'  Add it with: export PATH="{install_dir}:$PATH"')
 
 
 def main():
