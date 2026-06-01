@@ -39,51 +39,6 @@ def write_backlog(active, archive):
                 f.write(line + "\n")
 
 
-def show_help():
-    print("""Usage: bl [COMMAND] [ARGS...]
-
-A tiny backlog manager that operates on backlog.md in the current directory.
-
-Commands:
-  bl                      Show the backlog with line numbers.
-  bl add <text>           Add a new task (e.g. bl add fix login bug).
-  bl take <line>          Mark a task as in-progress.
-  bl untake <line>        Mark a task as todo.
-  bl done <line>          Mark a task as done.
-  bl available            Show only tasks that are available to take.
-  bl purge                Archive all completed tasks below the separator.
-  bl setup                Add the bl instruction to AGENTS.md or CLAUDE.md.
-  bl unsetup              Remove the bl instruction from AGENTS.md and CLAUDE.md.
-  bl config               Show configuration.
-  bl config agent         Show current agent.
-  bl config agent <name>  Set agent (codex, claude, pi).
-  bl help                 Show this help message.
-
-Status symbols:
-  [ ]  todo
-  [>]  in-progress
-  [x]  done
-
-File format (backlog.md):
-  The file is a plain Markdown list. Each task is a single line:
-
-    - [ ] Task description
-    - [>] Task in progress
-    - [x] Completed task
-
-  An optional archive section can be separated by a line containing
-  exactly three dashes:
-
-    - [ ] Active task
-    ---
-    - [x] Archived completed task
-
-  All commands except "purge" operate only on the active section
-  (everything above the --- separator). The "purge" command moves
-  all completed tasks from the active section into the archive.
-""")
-
-
 def show():
     active, _, _ = read_backlog()
     if not active:
@@ -344,11 +299,8 @@ def main():
         unsetup()
     elif cmd == "config":
         config_cmd(args[1:])
-    elif cmd in ("help", "-h", "--help"):
-        show_help()
     else:
-        print(f"Unknown command: {cmd}\n")
-        show_help()
+        print(f"Unknown command: {cmd}")
         sys.exit(1)
 
 
