@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+#
+# Install bl into ~/.local/bin:
+#     curl -sL https://raw.githubusercontent.com/bobuk/backlogger/main/bl | python3
+#
 """Simple backlog manager. Reads/writes backlog.md in the current directory."""
 
 import os
@@ -16,6 +20,9 @@ CONFIG_DIR = os.path.expanduser("~/.config/bl")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
 DEFAULT_AGENT = "claude"
 VALID_AGENTS = ("codex", "claude", "pi")
+INSTALL_DIR = os.path.expanduser("~/.local/bin")
+INSTALL_PATH = os.path.join(INSTALL_DIR, "bl")
+REPO_RAW_URL = "https://raw.githubusercontent.com/bobuk/backlogger/main/bl"
 
 
 def read_backlog():
@@ -52,8 +59,13 @@ Commands:
   bl done <line>          Mark a task as done.
   bl available            Show only tasks that are available to take.
   bl purge                Archive all completed tasks below the separator.
+  bl install              Install bl into ~/.local/bin.
   bl setup                Add the bl instruction to AGENTS.md or CLAUDE.md.
   bl unsetup              Remove the bl instruction from AGENTS.md and CLAUDE.md.
+
+Install via pipe:
+  cat $(which bl) | python3      Install bl into ~/.local/bin.
+  curl -sL <raw-url> | python3   Install bl from the repository.
 
 Status symbols:
   [ ]  todo
@@ -87,6 +99,18 @@ def show():
         return
     for i, line in enumerate(active, start=1):
         print(f"{i:3} {line}")
+
+
+def prompt_for_task():
+    if not sys.platform.startswith("win"):
+        try:
+            import readline  # noqa: F401  enables line editing in input()
+        except ImportError:
+            pass
+    try:
+        return input("Task: ").strip()
+    except EOFError:
+        return ""
 
 
 def add(text):
@@ -287,7 +311,50 @@ def config_cmd(args):
     print(f"Set {key} = {value}")
 
 
+def _self_source():
+    """Return the bl source code.
+
+    When bl is run as a normal file we read that file directly. When it is
+    piped into the interpreter (e.g. ``cat $(which bl) | python``) there is no
+    backing file and stdin is already exhausted, so we fetch the canonical
+    copy from the repository instead.
+    """
+    main_file = getattr(sys.modules["__main__"], "__file__", None)
+    if main_file and os.path.exists(main_file):
+        with open(main_file, "r", encoding="utf-8") as f:
+            return f.read()
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(REPO_RAW_URL) as resp:
+            return resp.read().decode("utf-8")
+    except Exception as exc:
+        print(f"Could not fetch bl source from {REPO_RAW_URL}: {exc}")
+        sys.exit(1)
+
+
+def install():
+    source = _self_source()
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    with open(INSTALL_PATH, "w", encoding="utf-8") as f:
+        f.write(source)
+    os.chmod(INSTALL_PATH, 0o755)
+    print(f"Installed bl to {INSTALL_PATH}")
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    if INSTALL_DIR not in path_dirs:
+        print(f"Note: {INSTALL_DIR} is not in your PATH.")
+        print(f'  Add it with: export PATH="{INSTALL_DIR}:$PATH"')
+
+
 def main():
+    # When piped into the interpreter there is no real backing file (__file__
+    # is None or "<stdin>"), so the only sensible action is to self-install:
+    # `cat $(which bl) | python` or `curl ... | python`.
+    main_file = getattr(sys.modules["__main__"], "__file__", None)
+    if main_file is None or not os.path.exists(main_file):
+        install()
+        return
+
     args = sys.argv[1:]
     if not args:
         show()
@@ -297,9 +364,13 @@ def main():
 
     if cmd in ("add", "a"):
         if len(args) < 2:
-            print("Usage: bl add <text>")
-            sys.exit(1)
-        add(" ".join(args[1:]))
+            text = prompt_for_task()
+            if not text:
+                print("Cancelled.")
+                return
+            add(text)
+        else:
+            add(" ".join(args[1:]))
     elif cmd in ("take", "t"):
         if len(args) != 2:
             print("Usage: bl take <line_number>")
@@ -338,6 +409,8 @@ def main():
         setup()
     elif cmd == "unsetup":
         unsetup()
+    elif cmd == "install":
+        install()
     elif cmd == "config":
         config_cmd(args[1:])
     elif cmd in ("help", "-h", "--help"):
