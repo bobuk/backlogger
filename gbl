@@ -4,6 +4,18 @@ import AppKit
 
 let backlogFileName = "backlog.md"
 let separator = "---"
+let statusEmpty = " "
+let statusTaken = ">"
+let statusDone = "x"
+
+enum BacklogError: Error {
+    case message(String)
+}
+
+enum CommandAction {
+    case launchApp
+    case exit(Int32)
+}
 
 struct BacklogTask {
     let lineNumber: Int
@@ -57,9 +69,56 @@ final class BacklogStore {
         }
 
         var sections = readSections()
-        sections.active.append("- [ ] \(cleanTitle)")
+        let isPriority = cleanTitle.contains("ASAP") || cleanTitle.contains("FIX")
+        if isPriority {
+            let hasInProgressTask = sections.active.contains { isTaskLine($0, withStatus: statusTaken) }
+            guard !hasInProgressTask else {
+                throw BacklogError.message("Cannot add a priority task while there are in-progress tasks.")
+            }
+            sections.active.insert("- [ ] \(cleanTitle)", at: 0)
+        } else {
+            sections.active.append("- [ ] \(cleanTitle)")
+        }
         try write(active: sections.active, archive: sections.archive)
         lastModificationDate = Self.modificationDate(for: fileURL)
+    }
+
+    func setStatus(lineNumber: Int, status: String) throws {
+        try requireBacklog()
+
+        var sections = readSections()
+        guard !sections.active.isEmpty else {
+            throw BacklogError.message("\(backlogFileName) is empty")
+        }
+
+        guard lineNumber >= 1 && lineNumber <= sections.active.count else {
+            throw BacklogError.message("Line \(lineNumber) does not exist (1-\(sections.active.count))")
+        }
+
+        let index = lineNumber - 1
+        sections.active[index] = replacingStatus(in: sections.active[index], with: status)
+        try write(active: sections.active, archive: sections.archive)
+        lastModificationDate = Self.modificationDate(for: fileURL)
+    }
+
+    func availableTasks() throws -> [BacklogTask] {
+        try requireBacklog()
+        return loadActiveTasks().filter { $0.status == statusEmpty }
+    }
+
+    func purgeCompletedTasks() throws -> Int {
+        try requireBacklog()
+
+        let sections = readSections()
+        let doneTasks = sections.active.filter { isTaskLine($0, withStatus: statusDone) }
+        guard !doneTasks.isEmpty else {
+            return 0
+        }
+
+        let remaining = sections.active.filter { !isTaskLine($0, withStatus: statusDone) }
+        try write(active: remaining, archive: sections.archive + doneTasks)
+        lastModificationDate = Self.modificationDate(for: fileURL)
+        return doneTasks.count
     }
 
     func toggleTaskProgress(lineNumber: Int) throws {
@@ -118,7 +177,10 @@ final class BacklogStore {
             return ([], [])
         }
 
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if text.hasSuffix("\n"), !lines.isEmpty {
+            lines.removeLast()
+        }
         guard let separatorIndex = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == separator }) else {
             return (lines, [])
         }
@@ -181,6 +243,31 @@ final class BacklogStore {
             return nil
         }
         return attrs[.modificationDate] as? Date
+    }
+
+    private func requireBacklog() throws {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw BacklogError.message("Error: \(backlogFileName) does not exist in the current directory.\nUse 'gbl add <text>' to create it.")
+        }
+    }
+
+    private func isTaskLine(_ line: String, withStatus status: String) -> Bool {
+        parseTask(line: line, lineNumber: 1)?.status == status
+    }
+
+    private func replacingStatus(in line: String, with status: String) -> String {
+        let pattern = #"^(\s*-\s*\[)[^\]](\]\s*)"#
+        guard
+            let regex = try? NSRegularExpression(pattern: pattern),
+            let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..<line.endIndex, in: line)),
+            match.numberOfRanges == 3,
+            let prefixRange = Range(match.range(at: 1), in: line),
+            let suffixRange = Range(match.range(at: 2), in: line)
+        else {
+            return line
+        }
+
+        return String(line[..<prefixRange.upperBound]) + status + String(line[suffixRange.lowerBound...])
     }
 }
 
@@ -377,11 +464,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         contentView.autoresizingMask = [.width, .height]
         window.contentView = contentView
 
-        let button = NSButton(title: "Add", target: self, action: #selector(addTask))
-        button.bezelStyle = .rounded
-        button.frame = NSRect(x: frame.width - 96, y: frame.height - 42, width: 76, height: 28)
-        button.autoresizingMask = [.minXMargin, .minYMargin]
-        contentView.addSubview(button)
+        let archiveButton = NSButton(title: "Archive", target: self, action: #selector(archiveCompletedTasks))
+        archiveButton.bezelStyle = .rounded
+        archiveButton.frame = NSRect(x: frame.width - 188, y: frame.height - 42, width: 84, height: 28)
+        archiveButton.autoresizingMask = [.minXMargin, .minYMargin]
+        archiveButton.toolTip = "Archive completed tasks"
+        contentView.addSubview(archiveButton)
+
+        let addButton = NSButton(title: "Add", target: self, action: #selector(addTask))
+        addButton.bezelStyle = .rounded
+        addButton.frame = NSRect(x: frame.width - 96, y: frame.height - 42, width: 76, height: 28)
+        addButton.autoresizingMask = [.minXMargin, .minYMargin]
+        contentView.addSubview(addButton)
 
         taskScrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: frame.width - 32, height: frame.height - 64))
         taskScrollView.autoresizingMask = [.width, .height]
@@ -448,7 +542,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             try store.addTask(title)
             reloadTasks()
         } catch {
-            showError("Could not save backlog.md: \(error.localizedDescription)")
+            showError("Could not save backlog.md: \(message(for: error))")
+        }
+    }
+
+    @objc private func archiveCompletedTasks() {
+        do {
+            _ = try store.purgeCompletedTasks()
+            reloadTasks()
+        } catch {
+            showError("Could not archive completed tasks: \(message(for: error))")
         }
     }
 
@@ -461,7 +564,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             try store.updateTask(lineNumber: task.lineNumber, title: title)
             reloadTasks(selectingLineNumber: task.lineNumber)
         } catch {
-            showError("Could not save backlog.md: \(error.localizedDescription)")
+            showError("Could not save backlog.md: \(message(for: error))")
         }
     }
 
@@ -474,7 +577,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             try store.toggleTaskProgress(lineNumber: task.lineNumber)
             reloadTasks(selectingLineNumber: task.lineNumber)
         } catch {
-            showError("Could not save backlog.md: \(error.localizedDescription)")
+            showError("Could not save backlog.md: \(message(for: error))")
         }
     }
 
@@ -487,7 +590,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             let newLineNumber = try store.moveTask(lineNumber: task.lineNumber, offset: offset)
             reloadTasks(selectingLineNumber: newLineNumber)
         } catch {
-            showError("Could not save backlog.md: \(error.localizedDescription)")
+            showError("Could not save backlog.md: \(message(for: error))")
         }
     }
 
@@ -684,6 +787,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         alert.informativeText = message
         alert.runModal()
     }
+
+    private func message(for error: Error) -> String {
+        if case BacklogError.message(let message) = error {
+            return message
+        }
+        return error.localizedDescription
+    }
 }
 
 final class ClosureTarget: NSObject {
@@ -698,8 +808,145 @@ final class ClosureTarget: NSObject {
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppController()
-app.delegate = delegate
-app.setActivationPolicy(.regular)
-app.run()
+func showHelp() {
+    print("""
+Usage: gbl [COMMAND] [ARGS...]
+
+A graphical backlog manager that operates on backlog.md in the current directory.
+
+Commands:
+  gbl                     Open the backlog window.
+  gbl add <text>          Add a new task.
+  gbl add                 Open the backlog window and show the add dialog.
+  gbl take <line>         Mark a task as in-progress.
+  gbl untake <line>       Mark a task as todo.
+  gbl done <line>         Mark a task as done.
+  gbl available           Show only tasks that are available to take.
+  gbl purge               Archive all completed tasks below the separator.
+  gbl show                Print the active backlog with line numbers.
+
+Agent, setup, config, and install commands remain available through bl.
+""")
+}
+
+func storeForCurrentDirectory() -> BacklogStore {
+    BacklogStore(
+        fileURL: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(backlogFileName)
+    )
+}
+
+func lineNumber(from args: [String], command: String) throws -> Int {
+    guard args.count == 2 else {
+        throw BacklogError.message("Usage: gbl \(command) <line_number>")
+    }
+    guard let lineNumber = Int(args[1]) else {
+        throw BacklogError.message("Line number must be an integer")
+    }
+    return lineNumber
+}
+
+func printTasks(_ tasks: [BacklogTask]) {
+    guard !tasks.isEmpty else {
+        print("(backlog is empty)")
+        return
+    }
+    for task in tasks {
+        print(String(format: "%3d - [%@] %@", task.lineNumber, task.status, task.title))
+    }
+}
+
+func commandAction(for args: [String]) -> CommandAction {
+    guard !args.isEmpty else {
+        return .launchApp
+    }
+
+    let command = args[0].lowercased()
+    let store = storeForCurrentDirectory()
+
+    do {
+        switch command {
+        case "add", "a":
+            guard args.count > 1 else {
+                return .launchApp
+            }
+            let title = args.dropFirst().joined(separator: " ")
+            try store.addTask(title)
+            print("Added: \(title)")
+            return .exit(0)
+
+        case "take", "t":
+            let lineNumber = try lineNumber(from: args, command: "take")
+            try store.setStatus(lineNumber: lineNumber, status: statusTaken)
+            print("Updated line \(lineNumber)")
+            return .exit(0)
+
+        case "untake", "u":
+            let lineNumber = try lineNumber(from: args, command: "untake")
+            try store.setStatus(lineNumber: lineNumber, status: statusEmpty)
+            print("Updated line \(lineNumber)")
+            return .exit(0)
+
+        case "done", "d":
+            let lineNumber = try lineNumber(from: args, command: "done")
+            try store.setStatus(lineNumber: lineNumber, status: statusDone)
+            print("Updated line \(lineNumber)")
+            return .exit(0)
+
+        case "available", "v":
+            let tasks = try store.availableTasks()
+            guard !tasks.isEmpty else {
+                print("(no available tasks)")
+                return .exit(0)
+            }
+            printTasks(tasks)
+            return .exit(0)
+
+        case "purge", "p":
+            let count = try store.purgeCompletedTasks()
+            guard count > 0 else {
+                print("(no completed tasks to archive)")
+                return .exit(0)
+            }
+            print("Archived \(count) task(s)")
+            return .exit(0)
+
+        case "show", "ls", "list":
+            printTasks(store.loadActiveTasks())
+            return .exit(0)
+
+        case "help", "-h", "--help":
+            showHelp()
+            return .exit(0)
+
+        case "run", "r", "setup", "unsetup", "install", "config":
+            print("`gbl \(command)` is not available. Use `bl \(command)` for agent, setup, config, or install commands.")
+            return .exit(1)
+
+        default:
+            print("Unknown command: \(command)\n")
+            showHelp()
+            return .exit(1)
+        }
+    } catch BacklogError.message(let message) {
+        print(message)
+        return .exit(1)
+    } catch {
+        print("Error: \(error.localizedDescription)")
+        return .exit(1)
+    }
+}
+
+var appDelegate: AppController?
+
+switch commandAction(for: Array(CommandLine.arguments.dropFirst())) {
+case .launchApp:
+    let app = NSApplication.shared
+    let delegate = AppController()
+    appDelegate = delegate
+    app.delegate = delegate
+    app.setActivationPolicy(.regular)
+    app.run()
+case .exit(let code):
+    Darwin.exit(code)
+}
