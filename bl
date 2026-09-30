@@ -5,19 +5,54 @@
 #
 """Simple backlog manager. Reads/writes backlog.md in the current directory."""
 
+import json
 import os
 import re
+import secrets
+import stat
+import string
 import subprocess
 import sys
+import tempfile
+import time
 import tomllib
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import dataclass
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on unsupported platforms
+    fcntl = None
+
+VERSION = "2.0.0"
 BACKLOG = "backlog.md"
 SEPARATOR = "---"
 STATUS_EMPTY = " "
 STATUS_TAKEN = ">"
 STATUS_DONE = "x"
-BL_INSTRUCTION = "Use `bl` to manage the local backlog stored in `backlog.md`. Run `bl help` for available commands. If asked to review or implement new tasks, start with `bl v` to see available tasks."
-RUN_PROMPT = "go through the backlog and complete all tasks"
+LOCK_TIMEOUT = 5.0
+PROVIDER_TIMEOUT = 4.0
+MAX_PROVIDER_DESCRIPTION = 1000
+MAX_PROVIDER_RESPONSE = 64 * 1024
+OPENAI_ENDPOINT = "https://api.openai.com/v1/responses"
+OPENAI_MODEL = "gpt-6-luna"
+ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+BL_INSTRUCTION = (
+    "Use `bl` to manage the local `backlog.md`, and use it as the only way to read or "
+    "modify that file; never open, edit, or rewrite backlog.md directly. Before starting "
+    "backlog work, run `bl v`, choose "
+    "a task by its visible ID, and successfully claim it with `bl take <id>`. Start work "
+    "only after that command succeeds; if it loses a competing claim, run `bl v` again."
+)
+RUN_PROMPT = (
+    "Work through the backlog using only bl commands; never read or edit backlog.md "
+    "directly. Run `bl v`, claim one task by ID with `bl take <id>`, and begin only after "
+    "the claim succeeds. If a claim fails, refresh with `bl v` and choose another task. "
+    "Complete claimed tasks and mark them done by ID."
+)
 CONFIG_DIR = os.path.expanduser("~/.config/bl")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
 DEFAULT_AGENT = "claude"
@@ -31,81 +66,1533 @@ DEFAULT_INSTALL_DIR = INSTALL_CANDIDATES[0]
 REPO_RAW_URL = "https://raw.githubusercontent.com/bobuk/backlogger/main/bl"
 
 
-def read_backlog():
-    if not os.path.exists(BACKLOG):
-        return [], [], False
-    with open(BACKLOG, "r", encoding="utf-8") as f:
-        lines = f.read().splitlines()
-    for i, line in enumerate(lines):
-        if line.strip() == SEPARATOR:
-            return lines[:i], lines[i + 1 :], True
-    return lines, [], False
+# Embedded macOS GUI (the bl-gui Swift app). Materialized to a temp
+# file and run via `bl gui` so bl stays a single self-contained script.
+BL_GUI_SOURCE = r'''#!/usr/bin/env swift
+
+import AppKit
+
+let backlogFileName = "backlog.md"
+let separator = "---"
+let statusEmpty = " "
+let statusTaken = ">"
+let statusDone = "x"
+
+enum BacklogError: Error {
+    case message(String)
+}
+
+enum CommandAction {
+    case launchApp
+    case exit(Int32)
+}
+
+struct BacklogTask {
+    let id: String
+    let lineNumber: Int
+    let status: String
+    let description: String
+
+    var title: String { "\(description) #\(id)" }
+}
+
+enum TaskViewMode {
+    case active
+    case completed
+}
+
+final class BacklogStore {
+    private let fileURL: URL
+    private let backendPath: String
+    private let pythonPath: String
+
+    init(fileURL: URL) {
+        self.fileURL = fileURL
+        self.backendPath = ProcessInfo.processInfo.environment["BL_BACKEND_PATH"] ?? ""
+        self.pythonPath = ProcessInfo.processInfo.environment["BL_PYTHON_EXECUTABLE"] ?? "/usr/bin/python3"
+    }
+
+    func loadActiveTasks() throws -> [BacklogTask] {
+        try loadTaskLists().active
+    }
+
+    func loadCompletedTasks() throws -> [BacklogTask] {
+        let result = try loadTaskLists()
+        return (result.active + result.archive).filter { $0.status.lowercased() == "x" }
+    }
+
+    func currentModificationDate() -> Date? {
+        Self.modificationDate(for: fileURL)
+    }
+
+    func addTask(_ title: String) throws {
+        _ = try request(action: "add", payload: ["text": title])
+    }
+
+    func setStatus(target: String, status: String, expectedStatus: String? = nil) throws {
+        var payload: [String: Any] = ["id": target, "status": status]
+        if let expectedStatus {
+            payload["expectedStatus"] = expectedStatus
+        }
+        _ = try request(action: "status", payload: payload)
+    }
+
+    func availableTasks() throws -> [BacklogTask] {
+        try loadTaskLists(requireExists: true).active.filter { $0.status == statusEmpty }
+    }
+
+    func purgeCompletedTasks() throws -> Int {
+        let result = try request(action: "purge", payload: [:])
+        return result["count"] as? Int ?? 0
+    }
+
+    func toggleTaskProgress(task: BacklogTask) throws {
+        guard task.status == statusEmpty || task.status == statusTaken else { return }
+        let nextStatus = task.status == statusTaken ? statusEmpty : statusTaken
+        try setStatus(target: task.id, status: nextStatus, expectedStatus: task.status)
+    }
+
+    func updateTask(task: BacklogTask, title: String) throws {
+        _ = try request(
+            action: "edit",
+            payload: [
+                "id": task.id,
+                "expectedDescription": task.description,
+                "description": title,
+            ]
+        )
+    }
+
+    func moveTask(task: BacklogTask, offset: Int) throws {
+        _ = try request(action: "move", payload: ["id": task.id, "offset": offset])
+    }
+
+    func loadTaskLists(requireExists: Bool = false) throws -> (active: [BacklogTask], archive: [BacklogTask]) {
+        let result = try request(action: "list", payload: ["requireExists": requireExists])
+        return (
+            try decodeTasks(result["active"]),
+            try decodeTasks(result["archive"])
+        )
+    }
+
+    private func decodeTasks(_ value: Any?) throws -> [BacklogTask] {
+        guard let rows = value as? [[String: Any]] else {
+            throw BacklogError.message("Invalid task list from bl backend")
+        }
+        return try rows.map { row in
+            guard
+                let id = row["id"] as? String,
+                let lineNumber = row["lineNumber"] as? Int,
+                let status = row["status"] as? String,
+                let description = row["description"] as? String
+            else {
+                throw BacklogError.message("Invalid task record from bl backend")
+            }
+            return BacklogTask(
+                id: id,
+                lineNumber: lineNumber,
+                status: status,
+                description: description
+            )
+        }
+    }
+
+    private func request(action: String, payload: [String: Any]) throws -> [String: Any] {
+        guard !backendPath.isEmpty else {
+            throw BacklogError.message("BL_BACKEND_PATH is missing; launch the app with `bl gui`")
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: pythonPath)
+        process.arguments = [backendPath, "_backend", action]
+        process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            let data = try JSONSerialization.data(withJSONObject: payload)
+            input.fileHandleForWriting.write(data)
+            try input.fileHandleForWriting.close()
+            let responseData = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard
+                let envelope = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+                let ok = envelope["ok"] as? Bool
+            else {
+                throw BacklogError.message("Invalid response from bl backend")
+            }
+            if !ok {
+                throw BacklogError.message(envelope["error"] as? String ?? "bl backend failed")
+            }
+            guard let result = envelope["result"] as? [String: Any] else {
+                throw BacklogError.message("Missing result from bl backend")
+            }
+            return result
+        } catch let error as BacklogError {
+            throw error
+        } catch {
+            throw BacklogError.message("Could not run bl backend: \(error.localizedDescription)")
+        }
+    }
+
+    private static func modificationDate(for url: URL) -> Date? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            return nil
+        }
+        return attrs[.modificationDate] as? Date
+    }
+}
+
+final class TaskTextView: NSTextView {
+    var onCommit: (() -> Void)?
+    var onCancel: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let isCommandA = event.modifierFlags.contains(.command) && event.keyCode == 0
+        if isCommandA {
+            selectAll(nil)
+            return
+        }
+
+        let isCommandReturn = event.modifierFlags.contains(.command) && (event.keyCode == 36 || event.keyCode == 76)
+        if isCommandReturn {
+            onCommit?()
+            return
+        }
+
+        if event.keyCode == 53 {
+            onCancel?()
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+}
+
+final class MainWindow: NSWindow {
+    var onSpace: (() -> Void)?
+    var onEscape: (() -> Void)?
+    var onQuit: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let isPlainSpace = event.charactersIgnoringModifiers == " " && event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
+        if isPlainSpace {
+            onSpace?()
+            return
+        }
+
+        let isCommandQ = event.modifierFlags.contains(.command) && event.keyCode == 12
+        if isCommandQ {
+            onQuit?()
+            return
+        }
+
+        if event.keyCode == 53 {
+            onEscape?()
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+}
+
+final class TaskPanel: NSPanel {
+    override var canBecomeKey: Bool {
+        true
+    }
+}
+
+final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    private let store = BacklogStore(fileURL: URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(backlogFileName))
+    private var tasks: [BacklogTask] = []
+    private var viewMode = TaskViewMode.active
+    private var window: NSWindow!
+    private var taskScrollView: NSScrollView!
+    private var tableView: NSTableView!
+    private var emptyLabel: NSTextField!
+    private var modalTargets: [ClosureTarget] = []
+    private var keyMonitor: Any?
+    private var lastModificationDate: Date?
+    private var reloadGeneration = 0
+    private let shouldOpenAddTaskOnLaunch: Bool = {
+        let args = Array(CommandLine.arguments.dropFirst())
+        return args.count == 1 && ["a", "add"].contains(args[0].lowercased())
+    }()
+    private var timer: Timer?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        installApplicationMenu()
+        buildWindow()
+        reloadTasks()
+        if shouldOpenAddTaskOnLaunch {
+            DispatchQueue.main.async { [weak self] in
+                self?.addTask()
+            }
+        }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard
+                let self,
+                NSApp.modalWindow == nil,
+                event.window === self.window
+            else {
+                return event
+            }
+
+            let isCommandQ = event.modifierFlags.contains(.command) && event.keyCode == 12
+            let isPlainKey = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
+            let isControlKey = event.modifierFlags.contains(.control) && event.modifierFlags.intersection([.command, .option, .shift]).isEmpty
+
+            if isCommandQ {
+                NSApp.terminate(nil)
+            } else if isPlainKey && event.keyCode == 53 {
+                NSApp.terminate(nil)
+            } else if isPlainKey && event.charactersIgnoringModifiers == " " {
+                self.addTask()
+            } else if isPlainKey && (event.keyCode == 36 || event.keyCode == 76) {
+                self.toggleSelectedTaskProgress()
+            } else if isPlainKey && event.keyCode == 14 {
+                self.editSelectedTask()
+            } else if isControlKey && event.keyCode == 126 {
+                self.moveSelectedTask(offset: -1)
+            } else if isControlKey && event.keyCode == 125 {
+                self.moveSelectedTask(offset: 1)
+            } else {
+                return event
+            }
+            return nil
+        }
+
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.reloadIfNeeded()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+        }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        tasks.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let identifier = tableColumn?.identifier ?? NSUserInterfaceItemIdentifier("TaskColumn")
+        let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView ?? NSTableCellView(frame: .zero)
+        let textField = cell.textField ?? NSTextField(labelWithString: "")
+
+        cell.identifier = identifier
+        cell.textField = textField
+        let isTaskColumn = identifier.rawValue == "TaskColumn"
+        textField.lineBreakMode = isTaskColumn ? .byWordWrapping : .byTruncatingTail
+        textField.usesSingleLineMode = !isTaskColumn
+        textField.maximumNumberOfLines = isTaskColumn ? 0 : 1
+        textField.cell?.wraps = isTaskColumn
+        if textField.superview == nil {
+            let horizontalPadding: CGFloat = isTaskColumn ? 8 : 2
+            textField.translatesAutoresizingMaskIntoConstraints = false
+            textField.textColor = .labelColor
+            cell.addSubview(textField)
+            NSLayoutConstraint.activate([
+                textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: horizontalPadding),
+                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -horizontalPadding),
+                textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+
+        let task = tasks[row]
+        switch identifier.rawValue {
+        case "LineColumn":
+            textField.stringValue = "\(task.lineNumber)"
+            textField.alignment = .center
+        case "StatusColumn":
+            textField.stringValue = displayStatus(task.status)
+            textField.alignment = .center
+        default:
+            let fontSize = NSFont.systemFontSize
+            let styledTitle = NSMutableAttributedString(
+                string: task.description,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: fontSize),
+                    .foregroundColor: NSColor.labelColor,
+                ]
+            )
+            styledTitle.append(
+                NSAttributedString(
+                    string: "  #\(task.id)",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
+                        .foregroundColor: NSColor.controlAccentColor,
+                        .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.14),
+                    ]
+                )
+            )
+            textField.attributedStringValue = styledTitle
+            textField.alignment = .left
+        }
+
+        return cell
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard tasks.indices.contains(row) else { return 28 }
+        let width = max(1, (tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("TaskColumn"))?.width ?? 520) - 20)
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let bounds = (tasks[row].title as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font]
+        )
+        return max(28, ceil(bounds.height) + 10)
+    }
+
+    private func installApplicationMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        let quitItem = NSMenuItem(
+            title: "Quit bl",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.keyEquivalentModifierMask = [.command]
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+        NSApp.mainMenu = mainMenu
+    }
+
+    private func buildWindow() {
+        let frame = NSRect(x: 0, y: 0, width: 720, height: 480)
+        window = MainWindow(
+            contentRect: frame,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "bl"
+        window.delegate = self
+        (window as? MainWindow)?.onSpace = { [weak self] in
+            self?.addTask()
+        }
+        (window as? MainWindow)?.onEscape = {
+            NSApp.terminate(nil)
+        }
+        (window as? MainWindow)?.onQuit = {
+            NSApp.terminate(nil)
+        }
+        window.center()
+
+        let contentView = NSView(frame: frame)
+        contentView.autoresizingMask = [.width, .height]
+        window.contentView = contentView
+
+        let archiveButton = NSButton(title: "📦 Archive", target: self, action: #selector(archiveCompletedTasks))
+        archiveButton.bezelStyle = .rounded
+        archiveButton.frame = NSRect(x: 16, y: frame.height - 42, width: 112, height: 28)
+        archiveButton.autoresizingMask = [.maxXMargin, .minYMargin]
+        archiveButton.toolTip = "Run bl purge"
+        contentView.addSubview(archiveButton)
+
+        let addButton = NSButton(title: "➕ Add", target: self, action: #selector(addTask))
+        addButton.bezelStyle = .rounded
+        addButton.frame = NSRect(x: frame.width - 104, y: frame.height - 42, width: 84, height: 28)
+        addButton.autoresizingMask = [.minXMargin, .minYMargin]
+        contentView.addSubview(addButton)
+
+        taskScrollView = NSScrollView(frame: NSRect(x: 16, y: 16, width: frame.width - 32, height: frame.height - 64))
+        taskScrollView.autoresizingMask = [.width, .height]
+        taskScrollView.hasVerticalScroller = true
+        taskScrollView.drawsBackground = true
+        taskScrollView.backgroundColor = .textBackgroundColor
+        contentView.addSubview(taskScrollView)
+
+        tableView = NSTableView(frame: taskScrollView.bounds)
+        tableView.autoresizingMask = [.width, .height]
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.headerView = nil
+        tableView.rowHeight = 28
+        tableView.backgroundColor = .textBackgroundColor
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.target = self
+        tableView.doubleAction = #selector(editClickedTask)
+
+        addColumn(identifier: "LineColumn", title: "#", width: 28)
+        addColumn(identifier: "StatusColumn", title: "Status", width: 30)
+        addColumn(identifier: "TaskColumn", title: "Task", width: 520)
+
+        taskScrollView.documentView = tableView
+
+        emptyLabel = NSTextField(labelWithString: "Backlog Zero")
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        emptyLabel.alignment = .center
+        emptyLabel.font = .boldSystemFont(ofSize: 28)
+        emptyLabel.textColor = .linkColor
+        emptyLabel.toolTip = "Show completed tasks"
+        emptyLabel.isHidden = true
+        emptyLabel.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(showCompletedTasks)))
+        contentView.addSubview(emptyLabel)
+        NSLayoutConstraint.activate([
+            emptyLabel.centerXAnchor.constraint(equalTo: taskScrollView.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: taskScrollView.centerYAnchor),
+        ])
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.terminate(nil)
+    }
+
+    private func addColumn(identifier: String, title: String, width: CGFloat) {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
+        column.title = title
+        column.width = width
+        column.minWidth = width
+        if identifier != "TaskColumn" {
+            column.maxWidth = width
+            column.resizingMask = []
+        }
+        tableView.addTableColumn(column)
+    }
+
+    @objc private func addTask() {
+        guard let title = openTaskEditor(title: "Add Task", initialText: "") else {
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.store.addTask(title)
+                DispatchQueue.main.async { [weak self] in self?.reloadTasks() }
+            } catch {
+                let text = self.message(for: error)
+                DispatchQueue.main.async { [weak self] in
+                    self?.showError("Could not save backlog.md: \(text)")
+                }
+            }
+        }
+    }
+
+    @objc private func archiveCompletedTasks() {
+        performMutation(errorPrefix: "Could not archive completed tasks") { [store] in
+            _ = try store.purgeCompletedTasks()
+        }
+    }
+
+    @objc private func editSelectedTask() {
+        guard let task = selectedActiveTask() else { return }
+        openEditor(for: task, draft: task.description)
+    }
+
+    @objc private func editClickedTask() {
+        let row = tableView.clickedRow
+        guard viewMode == .active, tasks.indices.contains(row) else { return }
+        let task = tasks[row]
+        openEditor(for: task, draft: task.description)
+    }
+
+    private func openEditor(for task: BacklogTask, draft: String) {
+        guard let title = openTaskEditor(title: "Edit Task", initialText: draft) else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.store.updateTask(task: task, title: title)
+                DispatchQueue.main.async { [weak self] in
+                    self?.reloadTasks(selectingID: task.id)
+                }
+            } catch {
+                let errorText = self.message(for: error)
+                let latest = try? self.store.loadTaskLists().active.first { $0.id == task.id }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let latestText = latest.map { "\n\nCurrent text: \($0.description)" } ?? ""
+                    self.showError(
+                        "Could not save backlog.md: \(errorText)\(latestText)\n\nYour draft will remain open."
+                    )
+                    self.openEditor(for: latest ?? task, draft: title)
+                }
+            }
+        }
+    }
+
+    private func toggleSelectedTaskProgress() {
+        guard let task = selectedActiveTask() else { return }
+        performMutation(
+            errorPrefix: "Could not save backlog.md",
+            selectingID: task.id
+        ) { [store] in
+            try store.toggleTaskProgress(task: task)
+        }
+    }
+
+    private func moveSelectedTask(offset: Int) {
+        guard let task = selectedActiveTask() else { return }
+        performMutation(
+            errorPrefix: "Could not save backlog.md",
+            selectingID: task.id
+        ) { [store] in
+            try store.moveTask(task: task, offset: offset)
+        }
+    }
+
+    private func performMutation(
+        errorPrefix: String,
+        selectingID: String? = nil,
+        operation: @escaping () throws -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                try operation()
+                DispatchQueue.main.async { [weak self] in
+                    self?.reloadTasks(selectingID: selectingID)
+                }
+            } catch {
+                let text = self.message(for: error)
+                DispatchQueue.main.async { [weak self] in
+                    self?.showError("\(errorPrefix): \(text)")
+                    self?.reloadTasks(selectingID: selectingID)
+                }
+            }
+        }
+    }
+
+    private func selectedActiveTask() -> BacklogTask? {
+        guard viewMode == .active, tableView.selectedRow >= 0, tasks.indices.contains(tableView.selectedRow) else {
+            return nil
+        }
+        return tasks[tableView.selectedRow]
+    }
+
+    private func openTaskEditor(title: String, initialText: String) -> String? {
+        let panel = TaskPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 176),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = title
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.isReleasedWhenClosed = false
+
+        let contentView = NSView(frame: panel.contentView?.bounds ?? .zero)
+        contentView.autoresizingMask = [.width, .height]
+        contentView.wantsLayer = true
+        contentView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        contentView.layer?.cornerRadius = 14
+        contentView.layer?.masksToBounds = true
+        panel.contentView = contentView
+
+        let controlBar = NSView(frame: NSRect(x: 10, y: 138, width: 400, height: 24))
+        controlBar.autoresizingMask = [.width, .minYMargin]
+        contentView.addSubview(controlBar)
+
+        let titleLabel = NSTextField(labelWithString: title == "Edit Task" ? "Edit task" : "New task")
+        titleLabel.frame = NSRect(x: 0, y: 3, width: 220, height: 20)
+        titleLabel.autoresizingMask = [.width]
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = .secondaryLabelColor
+        controlBar.addSubview(titleLabel)
+
+        let cancelButton = makeIconButton(
+            title: "✕",
+            backgroundColor: .systemRed,
+            toolTip: "Cancel",
+            frame: NSRect(x: 330, y: 0, width: 30, height: 24)
+        )
+        cancelButton.autoresizingMask = [.minXMargin]
+        controlBar.addSubview(cancelButton)
+
+        let addButton = makeIconButton(
+            title: "✓",
+            backgroundColor: .systemGreen,
+            toolTip: "Add",
+            frame: NSRect(x: 370, y: 0, width: 30, height: 24)
+        )
+        addButton.autoresizingMask = [.minXMargin]
+        controlBar.addSubview(addButton)
+
+        let inputScrollView = NSScrollView(frame: NSRect(x: 10, y: 10, width: 400, height: 118))
+        inputScrollView.hasVerticalScroller = true
+        inputScrollView.borderType = .bezelBorder
+        inputScrollView.autoresizingMask = [.width, .height]
+        contentView.addSubview(inputScrollView)
+
+        let inputTextView = TaskTextView(frame: inputScrollView.bounds)
+        inputTextView.autoresizingMask = [.width, .height]
+        inputTextView.isVerticallyResizable = true
+        inputTextView.isHorizontallyResizable = false
+        inputTextView.textContainer?.widthTracksTextView = true
+        inputTextView.font = .systemFont(ofSize: NSFont.systemFontSize)
+        inputTextView.string = initialText
+
+        inputScrollView.documentView = inputTextView
+
+        var shouldCommit = false
+        let stopModal = {
+            NSApp.stopModal()
+        }
+
+        let addTarget = ClosureTarget {
+            shouldCommit = true
+            stopModal()
+        }
+        addButton.target = addTarget
+        addButton.action = #selector(ClosureTarget.invoke)
+
+        let cancelTarget = ClosureTarget {
+            shouldCommit = false
+            stopModal()
+        }
+        cancelButton.target = cancelTarget
+        cancelButton.action = #selector(ClosureTarget.invoke)
+        modalTargets = [addTarget, cancelTarget]
+
+        inputTextView.onCommit = {
+            shouldCommit = true
+            stopModal()
+        }
+        inputTextView.onCancel = {
+            shouldCommit = false
+            stopModal()
+        }
+
+        if let parentFrame = window?.frame {
+            panel.setFrameOrigin(NSPoint(
+                x: parentFrame.midX - panel.frame.width / 2,
+                y: parentFrame.midY - panel.frame.height / 2
+            ))
+        } else {
+            panel.center()
+        }
+        panel.initialFirstResponder = inputTextView
+        panel.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async {
+            panel.makeFirstResponder(inputTextView)
+        }
+        NSApp.runModal(for: panel)
+        panel.orderOut(nil)
+        modalTargets = []
+
+        return shouldCommit ? inputTextView.string : nil
+    }
+
+    private func makeIconButton(title: String, backgroundColor: NSColor, toolTip: String, frame: NSRect) -> NSButton {
+        let button = NSButton(frame: frame)
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.backgroundColor = backgroundColor.cgColor
+        button.layer?.cornerRadius = 6
+        button.layer?.masksToBounds = true
+        button.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .foregroundColor: NSColor.white,
+                .font: NSFont.boldSystemFont(ofSize: 13),
+            ]
+        )
+        button.toolTip = toolTip
+        return button
+    }
+
+    private func reloadIfNeeded() {
+        guard store.currentModificationDate() != lastModificationDate else { return }
+        reloadTasks()
+    }
+
+    private func reloadTasks(selectingID: String? = nil) {
+        reloadGeneration += 1
+        let generation = reloadGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let modificationDate = self.store.currentModificationDate()
+                let result = try self.store.loadTaskLists()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, generation == self.reloadGeneration else { return }
+                    self.lastModificationDate = modificationDate
+                    if self.viewMode == .completed && result.active.isEmpty {
+                        self.tasks = (result.active + result.archive).filter {
+                            $0.status.lowercased() == "x"
+                        }
+                    } else {
+                        self.viewMode = .active
+                        self.tasks = result.active
+                    }
+                    self.tableView?.reloadData()
+                    self.taskScrollView?.isHidden = self.tasks.isEmpty
+                    self.emptyLabel?.isHidden = !self.tasks.isEmpty
+
+                    if let selectingID, let row = self.tasks.firstIndex(where: { $0.id == selectingID }) {
+                        self.tableView?.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                        self.tableView?.scrollRowToVisible(row)
+                    }
+                }
+            } catch {
+                let text = self.message(for: error)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, generation == self.reloadGeneration else { return }
+                    self.showError("Could not load backlog.md: \(text)")
+                }
+            }
+        }
+    }
+
+    @objc private func showCompletedTasks() {
+        viewMode = .completed
+        reloadTasks()
+    }
+
+    private func displayStatus(_ status: String) -> String {
+        switch status {
+        case " ":
+            return "⬜"
+        case ">":
+            return "▶️"
+        case "x", "X":
+            return "✅"
+        default:
+            return status
+        }
+    }
+
+    private func showError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Error"
+        alert.informativeText = message
+        alert.runModal()
+    }
+
+    private func message(for error: Error) -> String {
+        if case BacklogError.message(let message) = error {
+            return message
+        }
+        return error.localizedDescription
+    }
+}
+
+final class ClosureTarget: NSObject {
+    private let closure: () -> Void
+
+    init(_ closure: @escaping () -> Void) {
+        self.closure = closure
+    }
+
+    @objc func invoke() {
+        closure()
+    }
+}
+
+func showHelp() {
+    print("""
+Usage: bl gui [COMMAND] [ARGS...]
+
+A graphical backlog manager that operates on backlog.md in the current directory.
+
+Commands:
+  bl gui                       Open the backlog window.
+  bl gui add <text>            Add a new task.
+  bl gui add                   Open the window and show the add dialog.
+  bl gui take <id|line>        Atomically claim an available task.
+  bl gui untake <id|line>      Mark an active task as todo.
+  bl gui done <id|line>        Mark an active task as done.
+  bl gui available             Show only tasks available to claim.
+  bl gui purge                 Archive completed tasks.
+  bl gui show                  Print active tasks with stable IDs.
+
+Prefer stable IDs. Numeric operands are current physical line numbers and may
+be stale after another writer changes the backlog. macOS/Linux local files only.
+Agent, setup, config, and install commands remain available through bl.
+""")
+}
+
+func storeForCurrentDirectory() -> BacklogStore {
+    BacklogStore(
+        fileURL: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(backlogFileName)
+    )
+}
+
+func target(from args: [String], command: String) throws -> String {
+    guard args.count == 2 else {
+        throw BacklogError.message("Usage: bl gui \(command) <id|line_number>")
+    }
+    return args[1]
+}
+
+func printTasks(_ tasks: [BacklogTask]) {
+    guard !tasks.isEmpty else {
+        print("(backlog is empty)")
+        return
+    }
+    for task in tasks {
+        print(String(format: "%3d - [%@] %@", task.lineNumber, task.status, task.title))
+    }
+}
+
+func commandAction(for args: [String]) -> CommandAction {
+    guard !args.isEmpty else {
+        return .launchApp
+    }
+
+    let command = args[0].lowercased()
+    let store = storeForCurrentDirectory()
+
+    do {
+        switch command {
+        case "add", "a":
+            guard args.count > 1 else {
+                return .launchApp
+            }
+            let title = args.dropFirst().joined(separator: " ")
+            try store.addTask(title)
+            print("Added: \(title)")
+            return .exit(0)
+
+        case "take", "t":
+            let taskTarget = try target(from: args, command: "take")
+            try store.setStatus(target: taskTarget, status: statusTaken)
+            print("Updated \(taskTarget)")
+            return .exit(0)
+
+        case "untake", "u":
+            let taskTarget = try target(from: args, command: "untake")
+            try store.setStatus(target: taskTarget, status: statusEmpty)
+            print("Updated \(taskTarget)")
+            return .exit(0)
+
+        case "done", "d":
+            let taskTarget = try target(from: args, command: "done")
+            try store.setStatus(target: taskTarget, status: statusDone)
+            print("Updated \(taskTarget)")
+            return .exit(0)
+
+        case "available", "v":
+            let tasks = try store.availableTasks()
+            guard !tasks.isEmpty else {
+                print("(no available tasks)")
+                return .exit(0)
+            }
+            printTasks(tasks)
+            return .exit(0)
+
+        case "purge", "p":
+            let count = try store.purgeCompletedTasks()
+            guard count > 0 else {
+                print("(no completed tasks to archive)")
+                return .exit(0)
+            }
+            print("Archived \(count) task(s)")
+            return .exit(0)
+
+        case "show", "ls", "list":
+            printTasks(try store.loadActiveTasks())
+            return .exit(0)
+
+        case "help", "-h", "--help":
+            showHelp()
+            return .exit(0)
+
+        case "run", "r", "setup", "unsetup", "install", "config":
+            print("`bl gui \(command)` is not available. Use `bl \(command)` for agent, setup, config, or install commands.")
+            return .exit(1)
+
+        default:
+            print("Unknown command: \(command)\n")
+            showHelp()
+            return .exit(1)
+        }
+    } catch BacklogError.message(let message) {
+        print(message)
+        return .exit(1)
+    } catch {
+        print("Error: \(error.localizedDescription)")
+        return .exit(1)
+    }
+}
+
+var appDelegate: AppController?
+
+switch commandAction(for: Array(CommandLine.arguments.dropFirst())) {
+case .launchApp:
+    let app = NSApplication.shared
+    let delegate = AppController()
+    appDelegate = delegate
+    app.delegate = delegate
+    app.setActivationPolicy(.regular)
+    app.run()
+case .exit(let code):
+    Darwin.exit(code)
+}
+'''
 
 
-def write_backlog(active, archive):
-    with open(BACKLOG, "w", encoding="utf-8") as f:
-        for line in active:
-            f.write(line + "\n")
-        if archive:
-            f.write(SEPARATOR + "\n")
-            for line in archive:
-                f.write(line + "\n")
+class BacklogError(Exception):
+    """A user-visible operation error that must not commit staged changes."""
+
+
+TASK_RE = re.compile(r"^(\s*-\s*\[)(.)(\]\s*)(.*)$")
+TERMINAL_ID_RE = re.compile(r"(?:^|\s)#([A-Za-z][A-Za-z0-9_-]{4,})\s*$")
+GENERATED_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{4,5}\Z")
+
+
+@dataclass
+class Task:
+    status: str
+    description: str
+    task_id: str | None
+    line_number: int
+    section: str
+
+
+@dataclass
+class BacklogDocument:
+    active: list[str]
+    archive: list[str]
+    had_separator: bool
+    trailing_newline: bool
+    exists: bool
+    mode: int = 0o644
+    separator_line: str = SEPARATOR
+    newline: str = "\n"
+
+    def render(self):
+        lines = list(self.active)
+        if self.had_separator or self.archive:
+            lines.append(self.separator_line)
+            lines.extend(self.archive)
+        text = self.newline.join(lines)
+        if self.trailing_newline and (lines or self.exists):
+            text += self.newline
+        return text
+
+
+def parse_task(line, line_number=0, section="active"):
+    match = TASK_RE.match(line)
+    if not match:
+        return None
+    raw_description = match.group(4).rstrip()
+    id_match = TERMINAL_ID_RE.search(raw_description)
+    task_id = id_match.group(1) if id_match else None
+    description = raw_description[: id_match.start()].rstrip() if id_match else raw_description
+    return Task(match.group(2), description, task_id, line_number, section)
+
+
+def _backlog_paths():
+    target = os.path.realpath(os.path.abspath(BACKLOG))
+    return target, os.path.join(os.path.dirname(target), ".backlog.lock")
+
+
+@contextmanager
+def backlog_lock(timeout=LOCK_TIMEOUT):
+    if os.name != "posix" or fcntl is None:
+        raise BacklogError("bl locking is supported only on macOS and Linux")
+    _, lock_path = _backlog_paths()
+    try:
+        lock_file = open(lock_path, "a+", encoding="utf-8")
+    except OSError as exc:
+        raise BacklogError(f"Cannot open backlog lock: {exc.strerror or 'filesystem error'}") from None
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise BacklogError(
+                        f"Timed out waiting for another bl operation ({timeout:g}s)"
+                    ) from None
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_file.close()
+
+
+def _new_file_mode():
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    return 0o666 & ~current_umask
+
+
+def _read_document():
+    target, _ = _backlog_paths()
+    if not os.path.exists(target):
+        return BacklogDocument([], [], False, True, False, _new_file_mode())
+    try:
+        info = os.stat(target)
+        if info.st_nlink > 1:
+            raise BacklogError("Refusing to modify a hard-linked backlog.md")
+        with open(target, "rb") as handle:
+            raw = handle.read()
+        text = raw.decode("utf-8")
+    except BacklogError:
+        raise
+    except UnicodeDecodeError:
+        raise BacklogError("backlog.md is not valid UTF-8") from None
+    except OSError as exc:
+        raise BacklogError(f"Cannot read backlog.md: {exc.strerror or 'filesystem error'}") from None
+
+    lines = text.splitlines()
+    separator_index = next(
+        (index for index, line in enumerate(lines) if line.strip() == SEPARATOR), None
+    )
+    if separator_index is None:
+        active, archive, had_separator = lines, [], False
+    else:
+        active = lines[:separator_index]
+        archive = lines[separator_index + 1 :]
+        had_separator = True
+    return BacklogDocument(
+        active,
+        archive,
+        had_separator,
+        text.endswith(("\n", "\r")),
+        True,
+        stat.S_IMODE(info.st_mode),
+        lines[separator_index] if separator_index is not None else SEPARATOR,
+        "\r\n" if "\r\n" in text else "\n",
+    )
+
+
+def _atomic_write(document):
+    target, _ = _backlog_paths()
+    directory = os.path.dirname(target)
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".backlog.", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(document.render())
+            handle.flush()
+            os.fchmod(handle.fileno(), document.mode)
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+        temp_path = None
+    except OSError as exc:
+        raise BacklogError(f"Cannot save backlog.md: {exc.strerror or 'filesystem error'}") from None
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _task_locations(document):
+    for section_name, lines in (("active", document.active), ("archive", document.archive)):
+        for line_number, line in enumerate(lines, start=1):
+            task = parse_task(line, line_number, section_name)
+            if task:
+                yield task
+
+
+def _validate_unique_ids(document):
+    seen = {}
+    for task in _task_locations(document):
+        if not task.task_id:
+            continue
+        previous = seen.get(task.task_id)
+        if previous:
+            raise BacklogError(
+                f"Duplicate task ID #{task.task_id}: "
+                f"{previous.section} line {previous.line_number} and "
+                f"{task.section} line {task.line_number}"
+            )
+        seen[task.task_id] = task
+    return seen
+
+
+def _random_id(used):
+    alphabet = string.ascii_letters + string.digits
+    while True:
+        length = 5 + secrets.randbelow(2)
+        candidate = secrets.choice(string.ascii_letters) + "".join(
+            secrets.choice(alphabet) for _ in range(length - 1)
+        )
+        if candidate not in used:
+            return candidate
+
+
+def _migrate_missing_ids(document, reserved=()):
+    existing = _validate_unique_ids(document)
+    used = set(existing) | set(reserved)
+    changed = False
+    for lines in (document.active, document.archive):
+        for index, line in enumerate(lines):
+            task = parse_task(line)
+            if not task or task.task_id:
+                continue
+            task_id = _random_id(used)
+            used.add(task_id)
+            separator = "" if line.endswith((" ", "\t")) else " "
+            lines[index] = f"{line}{separator}#{task_id}"
+            changed = True
+    return used, changed
+
+
+def backlog_transaction(operation, *, create=False, reserved=()):
+    with backlog_lock():
+        document = _read_document()
+        original = document.render()
+        used, _ = _migrate_missing_ids(document, reserved)
+        result = operation(document, used)
+        updated = document.render()
+        if updated != original:
+            if not document.exists and not create:
+                return result
+            target, _ = _backlog_paths()
+            if document.exists and not os.access(target, os.W_OK, effective_ids=True):
+                raise BacklogError("backlog.md is not writable")
+            document.exists = True
+            document.trailing_newline = True
+            _atomic_write(document)
+        return result
+
+
+def _normalize_task_text(text, *, multiline=False):
+    if not isinstance(text, str):
+        raise BacklogError("Task text must be a string")
+    if multiline:
+        text = " ".join(text.split())
+    elif "\n" in text or "\r" in text:
+        raise BacklogError("Task text must fit on one line")
+    else:
+        text = text.strip()
+    if not text:
+        raise BacklogError("Task text cannot be empty")
+    return text
+
+
+def _terminal_id(text):
+    match = TERMINAL_ID_RE.search(text.rstrip())
+    return match.group(1) if match else None
+
+
+def _description_without_id(text):
+    match = TERMINAL_ID_RE.search(text.rstrip())
+    return text[: match.start()].rstrip() if match else text.rstrip()
+
+
+def _provider_selection():
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        return "openai"
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return "anthropic"
+    return None
+
+
+def _no_redirect_opener():
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    return urllib.request.build_opener(NoRedirect)
+
+
+def _fetch_provider_candidate(provider, description):
+    description = description[:MAX_PROVIDER_DESCRIPTION]
+    prompt = (
+        "Return exactly one 5-6 character task ID. Start with an ASCII letter; use only "
+        "ASCII letters, digits, underscore, or hyphen. No #, quotes, spaces, or prose."
+    )
+    if provider == "openai":
+        endpoint = OPENAI_ENDPOINT
+        key = os.environ.get("OPENAI_API_KEY", "")
+        payload = {
+            "model": OPENAI_MODEL,
+            "store": False,
+            "reasoning": {"effort": "none"},
+            "max_output_tokens": 16,
+            "input": [
+                {"role": "developer", "content": prompt},
+                {"role": "user", "content": description},
+            ],
+        }
+        headers = {"Authorization": f"Bearer {key}"}
+    elif provider == "anthropic":
+        endpoint = ANTHROPIC_ENDPOINT
+        key = os.environ.get("ANTHROPIC_API_KEY", "")
+        payload = {
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": 16,
+            "system": prompt,
+            "messages": [{"role": "user", "content": description}],
+        }
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    else:
+        raise ValueError("unknown provider")
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", **headers},
+        method="POST",
+    )
+    with _no_redirect_opener().open(request, timeout=PROVIDER_TIMEOUT) as response:
+        if response.status < 200 or response.status >= 300 or response.geturl() != endpoint:
+            raise ValueError("provider request failed")
+        raw = response.read(MAX_PROVIDER_RESPONSE + 1)
+        if len(raw) > MAX_PROVIDER_RESPONSE:
+            raise ValueError("provider response too large")
+    data = json.loads(raw.decode("utf-8"))
+    if provider == "openai":
+        if data.get("status") == "incomplete":
+            raise ValueError("incomplete response")
+        candidates = [
+            content.get("text")
+            for output in data.get("output", [])
+            if output.get("type") == "message"
+            for content in output.get("content", [])
+            if content.get("type") == "output_text"
+        ]
+    else:
+        candidates = [
+            block.get("text")
+            for block in data.get("content", [])
+            if block.get("type") == "text"
+        ]
+    if len(candidates) != 1 or not isinstance(candidates[0], str):
+        raise ValueError("invalid provider response")
+    candidate = candidates[0]
+    if not GENERATED_ID_RE.fullmatch(candidate):
+        raise ValueError("invalid provider ID")
+    return candidate
+
+
+def _semantic_candidate(description):
+    provider = _provider_selection()
+    if not provider:
+        return None
+    command = [sys.executable, os.path.abspath(__file__), "_id-helper", provider]
+    try:
+        result = subprocess.run(
+            command,
+            input=description,
+            text=True,
+            capture_output=True,
+            timeout=PROVIDER_TIMEOUT + 0.5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    candidate = result.stdout.strip()
+    if result.returncode != 0 or not GENERATED_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def add_task(text, *, multiline=False):
+    text = _normalize_task_text(text, multiline=multiline)
+    explicit_id = _terminal_id(text)
+    description = _description_without_id(text)
+    provider_candidate = None if explicit_id else _semantic_candidate(description)
+    candidate = explicit_id or provider_candidate
+    if not candidate:
+        candidate = _random_id(set())
+
+    def operation(document, used):
+        nonlocal candidate
+        actual_ids = set(_validate_unique_ids(document))
+        if explicit_id and explicit_id in actual_ids:
+            raise BacklogError(f"Task ID #{explicit_id} already exists")
+        if candidate in actual_ids:
+            candidate = _random_id(used)
+        if "ASAP" in description or "FIX" in description:
+            if any(task.status == STATUS_TAKEN for task in _task_locations(document) if task.section == "active"):
+                raise BacklogError("Cannot add a priority task while there are in-progress tasks.")
+            document.active.insert(0, f"- [ ] {description} #{candidate}")
+        else:
+            document.active.append(f"- [ ] {description} #{candidate}")
+        return {"id": candidate, "description": description}
+
+    return backlog_transaction(operation, create=True, reserved=(candidate,))
+
+
+def _find_active_task(document, target):
+    target = str(target)
+    try:
+        line_number = int(target.strip(), 10)
+    except ValueError:
+        line_number = None
+    if line_number is not None:
+        if line_number < 1 or line_number > len(document.active):
+            raise BacklogError(f"Line {line_number} does not exist (1-{len(document.active)})")
+        task = parse_task(document.active[line_number - 1], line_number, "active")
+        if not task:
+            raise BacklogError(f"Line {line_number} is not a task")
+        return task
+    for task in _task_locations(document):
+        if task.task_id == target:
+            if task.section != "active":
+                raise BacklogError(f"Task #{target} is archived")
+            return task
+    raise BacklogError(f"Task ID #{target} was not found")
+
+
+def set_task_status(target, status, *, expected_status=None):
+    if status not in (STATUS_EMPTY, STATUS_TAKEN, STATUS_DONE):
+        raise BacklogError("Invalid task status")
+
+    def operation(document, _used):
+        if not document.exists:
+            raise BacklogError("backlog.md does not exist in the current directory")
+        task = _find_active_task(document, target)
+        if expected_status is not None and task.status != expected_status:
+            raise BacklogError(
+                f"Task #{task.task_id} changed from [{expected_status}] to [{task.status}]; refresh and try again"
+            )
+        if status == STATUS_TAKEN and task.status != STATUS_EMPTY:
+            raise BacklogError(f"Task #{task.task_id} is not available (status [{task.status}])")
+        index = task.line_number - 1
+        document.active[index] = TASK_RE.sub(
+            lambda match: f"{match.group(1)}{status}{match.group(3)}{match.group(4)}",
+            document.active[index],
+            count=1,
+        )
+        return {"id": task.task_id, "lineNumber": task.line_number, "status": status}
+
+    return backlog_transaction(operation)
+
+
+def list_tasks(*, require_exists=False):
+    def operation(document, _used):
+        if require_exists and not document.exists:
+            raise BacklogError(
+                "backlog.md does not exist in the current directory; use 'bl add <text>' to create it"
+            )
+        def encode(lines, section):
+            tasks = []
+            for line_number, line in enumerate(lines, start=1):
+                task = parse_task(line, line_number, section)
+                if task:
+                    tasks.append(
+                        {
+                            "id": task.task_id,
+                            "lineNumber": line_number,
+                            "status": task.status,
+                            "description": task.description,
+                        }
+                    )
+            return tasks
+
+        return {"active": encode(document.active, "active"), "archive": encode(document.archive, "archive")}
+
+    return backlog_transaction(operation)
+
+
+def purge_tasks():
+    def operation(document, _used):
+        if not document.exists:
+            raise BacklogError("backlog.md does not exist in the current directory")
+        done = [line for line in document.active if (parse_task(line) and parse_task(line).status == STATUS_DONE)]
+        if not done:
+            return {"count": 0}
+        document.active = [line for line in document.active if not (parse_task(line) and parse_task(line).status == STATUS_DONE)]
+        document.archive.extend(done)
+        document.had_separator = True
+        return {"count": len(done)}
+
+    return backlog_transaction(operation)
+
+
+def move_task(task_id, offset):
+    def operation(document, _used):
+        task = _find_active_task(document, task_id)
+        source = task.line_number - 1
+        destination = source + int(offset)
+        if destination < 0 or destination >= len(document.active):
+            return {"id": task.task_id, "lineNumber": task.line_number}
+        line = document.active.pop(source)
+        document.active.insert(destination, line)
+        return {"id": task.task_id, "lineNumber": destination + 1}
+
+    return backlog_transaction(operation)
+
+
+def edit_task(task_id, expected_description, new_description):
+    new_description = _normalize_task_text(new_description, multiline=True)
+
+    def operation(document, _used):
+        task = _find_active_task(document, task_id)
+        if expected_description is not None and task.description != expected_description:
+            raise BacklogError(
+                f"Task #{task_id} was edited elsewhere; your draft was not saved"
+            )
+        index = task.line_number - 1
+        match = TASK_RE.match(document.active[index])
+        document.active[index] = (
+            f"{match.group(1)}{task.status}{match.group(3)}{new_description} #{task.task_id}"
+        )
+        return {"id": task.task_id, "description": new_description, "status": task.status}
+
+    return backlog_transaction(operation)
 
 
 def show_help():
-    print("""Usage: bl [COMMAND] [ARGS...]
+    print(f"""Usage: bl [COMMAND] [ARGS...]
 
 A tiny backlog manager that operates on backlog.md in the current directory.
+Version: {VERSION} (major backlog-format change)
 
 Commands:
-  bl                      Show the backlog with line numbers.
-  bl add <text>           Add a new task (e.g. bl add fix login bug).
-  bl take <line>          Mark a task as in-progress.
-  bl untake <line>        Mark a task as todo.
-  bl done <line>          Mark a task as done.
-  bl available            Show only tasks that are available to take.
-  bl run                  Ask the configured AI agent to execute the backlog.
-  bl purge                Archive all completed tasks below the separator.
-  bl install              Install bl into ~/.local/bin.
-  bl setup                Add the bl instruction to AGENTS.md or CLAUDE.md.
-  bl unsetup              Remove the bl instruction from AGENTS.md and CLAUDE.md.
+  bl                         Show active tasks and stable IDs.
+  bl add <text>              Add a task; quote an explicit final ID: 'task #login'.
+  bl take <id|line>          Atomically claim an available task.
+  bl untake <id|line>        Mark an active task as todo.
+  bl done <id|line>          Mark an active task as done.
+  bl available               Show tasks available to claim.
+  bl completed               Show completed active and archived tasks.
+  bl edit <id> <text>        Replace an active task description by stable ID.
+  bl move <id> <up|down>     Move an active task by stable ID.
+  bl gui [args...]           Open the native macOS GUI.
+  bl run                     Ask the configured AI agent to execute the backlog.
+  bl purge                   Archive completed [x] tasks.
+  bl install                 Install bl into ~/.local/bin.
+  bl setup                   Add strict bl-only agent instructions.
+  bl unsetup                 Remove generated agent instructions.
 
-Install via pipe:
-  cat $(which bl) | python3      Install bl into ~/.local/bin.
-  curl -sL <raw-url> | python3   Install bl from the repository.
+IDs are the final #token on each task. Prefer IDs: numeric operands are physical
+active-section line numbers and may target a different task after concurrent edits.
+All cooperating writers must use this updated bl; direct edits are not protected.
+Concurrent transactions are supported on local macOS/Linux filesystems.
 
-Status symbols:
-  [ ]  todo
-  [>]  in-progress
-  [x]  done
+If OPENAI_API_KEY or ANTHROPIC_API_KEY is set, adding a task may send only its
+bounded description to that provider for an ID suggestion. OpenAI is preferred
+when both are set. Any provider failure falls back to a local random ID.
 
-File format (backlog.md):
-  The file is a plain Markdown list. Each task is a single line:
-
-    - [ ] Task description
-    - [>] Task in progress
-    - [x] Completed task
-
-  An optional archive section can be separated by a line containing
-  exactly three dashes:
-
-    - [ ] Active task
-    ---
-    - [x] Archived completed task
-
-  All commands except "purge" operate only on the active section
-  (everything above the --- separator). The "purge" command moves
-  all completed tasks from the active section into the archive.
+Status symbols: [ ] todo, [>] in-progress, [x] done.
 """)
 
 
 def show():
-    active, _, _ = read_backlog()
-    if not active:
+    lines = []
+
+    def collect(document, _used):
+        lines.extend(document.active)
+
+    backlog_transaction(collect)
+    if not lines:
         print("(backlog is empty)")
         return
-    for i, line in enumerate(active, start=1):
-        print(f"{i:3} {line}")
+    for index, line in enumerate(lines, start=1):
+        print(f"{index:3} {line}")
 
 
 def prompt_for_task():
@@ -120,75 +1607,31 @@ def prompt_for_task():
         return ""
 
 
-def add(text):
-    active, archive, _ = read_backlog()
-    is_priority = "ASAP" in text or "FIX" in text
-    if is_priority:
-        has_in_progress = any(
-            re.search(r"^\s*-\s*\[>\]", line) for line in active
-        )
-        if has_in_progress:
-            print("Cannot add a priority task while there are in-progress tasks.")
-            sys.exit(1)
-        active.insert(0, f"- [ ] {text}")
-    else:
-        active.append(f"- [ ] {text}")
-    write_backlog(active, archive)
-    print(f"Added: {text}")
-
-
-def require_backlog():
-    if not os.path.exists(BACKLOG):
-        print(f"Error: {BACKLOG} does not exist in the current directory.")
-        print("Use 'bl add <text>' to create it.")
-        sys.exit(1)
-
-
-def set_status(line_no, status_char):
-    require_backlog()
-    active, archive, _ = read_backlog()
-    if not active:
-        print("backlog.md is empty")
-        sys.exit(1)
-    if line_no < 1 or line_no > len(active):
-        print(f"Line {line_no} does not exist (1-{len(active)})")
-        sys.exit(1)
-    idx = line_no - 1
-    old_line = active[idx]
-    new_line = re.sub(r"^(\s*-\s*\[)[^\]](\]\s*)", r"\1" + status_char + r"\2", old_line, count=1)
-    active[idx] = new_line
-    write_backlog(active, archive)
-    print(f"Updated line {line_no}")
-
-
 def show_available():
-    require_backlog()
-    active, _, _ = read_backlog()
-    found = False
-    for i, line in enumerate(active, start=1):
-        if re.search(r"^\s*-\s*\[\s\]", line):
-            print(f"{i:3} {line}")
-            found = True
-    if not found:
+    data = list_tasks(require_exists=True)
+    available = [task for task in data["active"] if task["status"] == STATUS_EMPTY]
+    if not available:
         print("(no available tasks)")
-
-
-def purge():
-    require_backlog()
-    active, archive, _ = read_backlog()
-    done_tasks = []
-    remaining = []
-    for line in active:
-        if re.search(r"^\s*-\s*\[x\]", line):
-            done_tasks.append(line)
-        else:
-            remaining.append(line)
-    if not done_tasks:
-        print("(no completed tasks to archive)")
         return
-    archive.extend(done_tasks)
-    write_backlog(remaining, archive)
-    print(f"Archived {len(done_tasks)} task(s)")
+    for task in available:
+        print(
+            f"{task['lineNumber']:3} - [ ] {task['description']} #{task['id']}"
+        )
+
+
+def show_completed():
+    data = list_tasks(require_exists=True)
+    completed = [
+        (section, task)
+        for section in ("active", "archive")
+        for task in data[section]
+        if task["status"].lower() == STATUS_DONE
+    ]
+    if not completed:
+        print("(no completed tasks)")
+        return
+    for section, task in completed:
+        print(f"{section:7} {task['lineNumber']:3} - [{task['status']}] {task['description']} #{task['id']}")
 
 
 def setup():
@@ -318,6 +1761,79 @@ def config_cmd(args):
     print(f"Set {key} = {value}")
 
 
+def run_gui(args):
+    """Materialize the embedded Swift app uniquely and bridge it back to this script."""
+    if sys.platform != "darwin":
+        raise BacklogError("The native GUI is supported only on macOS")
+    with tempfile.TemporaryDirectory(prefix="bl-gui-") as temp_dir:
+        gui_path = os.path.join(temp_dir, "bl-gui.swift")
+        with open(gui_path, "w", encoding="utf-8") as handle:
+            handle.write(BL_GUI_SOURCE)
+        env = os.environ.copy()
+        env["BL_BACKEND_PATH"] = os.path.abspath(__file__)
+        env["BL_PYTHON_EXECUTABLE"] = sys.executable
+        try:
+            result = subprocess.run(["swift", gui_path, *args], env=env)
+        except FileNotFoundError:
+            raise BacklogError(
+                "The GUI needs Swift (install Xcode or the Command Line Tools: xcode-select --install)"
+            ) from None
+    if result.returncode:
+        raise BacklogError(f"The GUI exited with status {result.returncode}")
+
+
+def _backend_action(action, payload):
+    if action == "list":
+        return list_tasks(require_exists=bool(payload.get("requireExists", False)))
+    if action == "add":
+        return add_task(payload.get("text", ""), multiline=True)
+    if action == "status":
+        return set_task_status(
+            payload.get("id", ""),
+            payload.get("status", ""),
+            expected_status=payload.get("expectedStatus"),
+        )
+    if action == "purge":
+        return purge_tasks()
+    if action == "move":
+        return move_task(payload.get("id", ""), payload.get("offset", 0))
+    if action == "edit":
+        return edit_task(
+            payload.get("id", ""),
+            payload.get("expectedDescription", ""),
+            payload.get("description", ""),
+        )
+    raise BacklogError(f"Unknown backend action: {action}")
+
+
+def run_backend(action):
+    try:
+        raw = sys.stdin.read(MAX_PROVIDER_RESPONSE + 1)
+        if len(raw) > MAX_PROVIDER_RESPONSE:
+            raise BacklogError("Backend request is too large")
+        payload = json.loads(raw or "{}")
+        if not isinstance(payload, dict):
+            raise BacklogError("Backend request must be a JSON object")
+        result = _backend_action(action, payload)
+        print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
+        return 0
+    except (BacklogError, json.JSONDecodeError) as exc:
+        message = str(exc) if isinstance(exc, BacklogError) else "Invalid backend JSON"
+        print(json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+        return 1
+
+
+def run_id_helper(provider):
+    try:
+        description = sys.stdin.read(MAX_PROVIDER_DESCRIPTION + 1)
+        if len(description) > MAX_PROVIDER_DESCRIPTION:
+            return 1
+        print(_fetch_provider_candidate(provider, description), end="")
+        return 0
+    except Exception:
+        return 1
+
+
 def run_agent():
     config = read_config()
     agent = config.get("agent", DEFAULT_AGENT)
@@ -388,80 +1904,94 @@ def install():
 
 def main():
     # When piped into the interpreter there is no real backing file (__file__
-    # is None or "<stdin>"), so the only sensible action is to self-install:
-    # `cat $(which bl) | python` or `curl ... | python`.
+    # is None or "<stdin>"), so the only sensible action is to self-install.
     main_file = getattr(sys.modules["__main__"], "__file__", None)
     if main_file is None or not os.path.exists(main_file):
         install()
         return
 
     args = sys.argv[1:]
-    if not args:
-        show()
-        return
+    if args and args[0] == "_id-helper":
+        if len(args) != 2:
+            return 1
+        return run_id_helper(args[1])
+    if args and args[0] == "_backend":
+        if len(args) != 2:
+            return 1
+        return run_backend(args[1])
 
-    cmd = args[0]
+    try:
+        if not args:
+            show()
+            return 0
+        cmd = args[0]
 
-    if cmd in ("add", "a"):
-        if len(args) < 2:
-            text = prompt_for_task()
+        if cmd in ("--version", "-V", "version"):
+            print(f"bl {VERSION}")
+        elif cmd in ("add", "a"):
+            text = " ".join(args[1:]) if len(args) > 1 else prompt_for_task()
             if not text:
                 print("Cancelled.")
-                return
-            add(text)
+                return 0
+            result = add_task(text)
+            print(f"Added #{result['id']}: {result['description']}")
+        elif cmd in ("take", "t", "untake", "u", "done", "d"):
+            if len(args) != 2:
+                raise BacklogError(f"Usage: bl {cmd} <id|line_number>")
+            status = {
+                "take": STATUS_TAKEN,
+                "t": STATUS_TAKEN,
+                "untake": STATUS_EMPTY,
+                "u": STATUS_EMPTY,
+                "done": STATUS_DONE,
+                "d": STATUS_DONE,
+            }[cmd]
+            result = set_task_status(args[1], status)
+            print(f"Updated #{result['id']} (line {result['lineNumber']})")
+        elif cmd in ("available", "v"):
+            show_available()
+        elif cmd in ("completed", "archive"):
+            if len(args) != 1:
+                raise BacklogError(f"Usage: bl {cmd}")
+            show_completed()
+        elif cmd in ("edit", "e"):
+            if len(args) < 3:
+                raise BacklogError(f"Usage: bl {cmd} <id> <text>")
+            result = edit_task(args[1], None, " ".join(args[2:]))
+            print(f"Edited #{result['id']}")
+        elif cmd in ("move", "m"):
+            if len(args) != 3 or args[2].lower() not in ("up", "down"):
+                raise BacklogError(f"Usage: bl {cmd} <id> <up|down>")
+            offset = -1 if args[2].lower() == "up" else 1
+            result = move_task(args[1], offset)
+            print(f"Moved #{result['id']} to line {result['lineNumber']}")
+        elif cmd in ("gui", "g"):
+            run_gui(args[1:])
+        elif cmd in ("run", "r"):
+            run_agent()
+        elif cmd in ("purge", "p"):
+            result = purge_tasks()
+            if result["count"]:
+                print(f"Archived {result['count']} task(s)")
+            else:
+                print("(no completed tasks to archive)")
+        elif cmd == "setup":
+            setup()
+        elif cmd == "unsetup":
+            unsetup()
+        elif cmd == "install":
+            install()
+        elif cmd == "config":
+            config_cmd(args[1:])
+        elif cmd in ("help", "-h", "--help"):
+            show_help()
         else:
-            add(" ".join(args[1:]))
-    elif cmd in ("take", "t"):
-        if len(args) != 2:
-            print("Usage: bl take <line_number>")
-            sys.exit(1)
-        try:
-            n = int(args[1])
-        except ValueError:
-            print("Line number must be an integer")
-            sys.exit(1)
-        set_status(n, STATUS_TAKEN)
-    elif cmd in ("untake", "u"):
-        if len(args) != 2:
-            print("Usage: bl untake <line_number>")
-            sys.exit(1)
-        try:
-            n = int(args[1])
-        except ValueError:
-            print("Line number must be an integer")
-            sys.exit(1)
-        set_status(n, STATUS_EMPTY)
-    elif cmd in ("done", "d"):
-        if len(args) != 2:
-            print("Usage: bl done <line_number>")
-            sys.exit(1)
-        try:
-            n = int(args[1])
-        except ValueError:
-            print("Line number must be an integer")
-            sys.exit(1)
-        set_status(n, STATUS_DONE)
-    elif cmd in ("available", "v"):
-        show_available()
-    elif cmd in ("run", "r"):
-        run_agent()
-    elif cmd in ("purge", "p"):
-        purge()
-    elif cmd == "setup":
-        setup()
-    elif cmd == "unsetup":
-        unsetup()
-    elif cmd == "install":
-        install()
-    elif cmd == "config":
-        config_cmd(args[1:])
-    elif cmd in ("help", "-h", "--help"):
-        show_help()
-    else:
-        print(f"Unknown command: {cmd}\n")
-        show_help()
-        sys.exit(1)
+            raise BacklogError(f"Unknown command: {cmd}")
+        return 0
+    except BacklogError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
