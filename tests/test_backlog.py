@@ -72,7 +72,8 @@ class ParsingAndMigrationTests(BacklogTestCase):
         self.assertEqual(task.task_id, "refreshDesign")
         self.assertEqual(task.line_number, 4)
         self.assertIsNone(bl.parse_task("- [ ] malformed #12").task_id)
-        self.assertIsNone(bl.parse_task("- [ ] short #abcd").task_id)
+        self.assertEqual(bl.parse_task("- [ ] abbreviated #SCR").task_id, "SCR")
+        self.assertIsNone(bl.parse_task("- [ ] short #ab").task_id)
 
     def test_first_read_migrates_active_and_archive_once(self):
         original = "heading\n- [ ] active #api note\n---\n- [x] archived\n"
@@ -203,6 +204,21 @@ class TransactionAndCommandTests(BacklogTestCase):
         with self.assertRaisesRegex(bl.BacklogError, "valid UTF-8"):
             bl.list_tasks()
         self.assertEqual(Path("backlog.md").read_bytes(), before)
+
+    def test_ctrl_c_during_interactive_inputs_cancels_without_traceback_or_write(self):
+        for command in ("add", "setup"):
+            with self.subTest(command=command):
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", ["bl", command]), mock.patch(
+                    "builtins.input", side_effect=KeyboardInterrupt
+                ), contextlib.redirect_stderr(output):
+                    code = bl.main()
+                self.assertEqual(code, 130)
+                self.assertIn("Cancelled.", output.getvalue())
+                self.assertNotIn("Traceback", output.getvalue())
+                self.assertFalse(Path("backlog.md").exists())
+                self.assertFalse(Path("AGENTS.md").exists())
+                self.assertFalse(Path("CLAUDE.md").exists())
 
     def test_lock_wait_has_bounded_failure(self):
         holder_code = (
@@ -416,7 +432,7 @@ class ProviderAndDocumentationTests(BacklogTestCase):
                 {
                     "status": "completed",
                     "output": [
-                        {"type": "message", "content": [{"type": "output_text", "text": "login1"}]}
+                        {"type": "message", "content": [{"type": "output_text", "text": "login1\n"}]}
                     ],
                 },
                 "login1",
@@ -444,6 +460,15 @@ class ProviderAndDocumentationTests(BacklogTestCase):
                 if provider == "openai":
                     self.assertFalse(sent["store"])
                     self.assertEqual(sent["reasoning"], {"effort": "none"})
+
+    def test_generated_ids_allow_three_to_eight_characters(self):
+        for candidate in ("SCR", "ABCDEFGH"):
+            with self.subTest(candidate=candidate):
+                self.assertRegex(candidate, bl.GENERATED_ID_RE)
+                self.assertEqual(bl.parse_task(f"- [ ] task #{candidate}").task_id, candidate)
+        for candidate in ("AB", "ABCDEFGHI"):
+            with self.subTest(candidate=candidate):
+                self.assertIsNone(bl.GENERATED_ID_RE.fullmatch(candidate))
 
     def test_provider_rejects_malformed_redirected_and_oversized_responses(self):
         valid_endpoint = bl.OPENAI_ENDPOINT
@@ -487,6 +512,81 @@ class ProviderAndDocumentationTests(BacklogTestCase):
         fetch.assert_called_once_with("openai", "task")
         self.assertNotIn("synthetic-secret", output.getvalue())
 
+    def test_setup_uses_llm_assessment_to_place_instruction_near_related_section(self):
+        original = (
+            "# Project\nGeneral guidance.\n## Workflow\n"
+            "Use `bl` to manage old instructions.\nKeep the project-specific rule.\n"
+        )
+        Path("AGENTS.md").write_text(original, encoding="utf-8")
+        response_body = {
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": json.dumps({"assessment": "partial", "insert_after_line": 4}),
+                }],
+            }],
+        }
+        response = self.FakeResponse(bl.OPENAI_ENDPOINT, json.dumps(response_body).encode())
+        opener = self.FakeOpener(response)
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "setup-secret"}), mock.patch.object(
+            bl, "_no_redirect_opener", return_value=opener
+        ), contextlib.redirect_stdout(output):
+            bl.setup()
+        text = Path("AGENTS.md").read_text(encoding="utf-8")
+        self.assertEqual(
+            text,
+            "# Project\nGeneral guidance.\n## Workflow\n" + bl.BL_INSTRUCTION + "\nKeep the project-specific rule.\n",
+        )
+        self.assertIn("LLM assessment for AGENTS.md: partial", output.getvalue())
+        self.assertEqual(opener.request.get_method(), "POST")
+        payload = json.loads(opener.request.data)
+        self.assertEqual(payload["model"], bl.OPENAI_MODEL)
+        self.assertFalse(payload["store"])
+        self.assertIn("Use `bl` to manage old instructions.", payload["input"][-1]["content"])
+        self.assertIn("untrusted data", payload["input"][0]["content"])
+        self.assertEqual(opener.request.get_header("Authorization"), "Bearer setup-secret")
+        self.assertNotIn("setup-secret", output.getvalue())
+
+    def test_setup_assessment_supports_anthropic(self):
+        assessment = {"assessment": "equivalent", "insert_after_line": 1}
+        response_body = {"content": [{"type": "text", "text": json.dumps(assessment)}]}
+        response = self.FakeResponse(bl.ANTHROPIC_ENDPOINT, json.dumps(response_body).encode())
+        opener = self.FakeOpener(response)
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "anthropic-setup-secret"}), mock.patch.object(
+            bl, "_no_redirect_opener", return_value=opener
+        ):
+            result = bl._fetch_setup_assessment("anthropic", "CLAUDE.md", ["# Agent guide\n"])
+        self.assertEqual(result, assessment)
+        self.assertEqual(opener.request.get_header("X-api-key"), "anthropic-setup-secret")
+        payload = json.loads(opener.request.data)
+        self.assertEqual(payload["model"], bl.ANTHROPIC_MODEL)
+        self.assertIn("untrusted data", payload["system"])
+
+    def test_setup_uses_deterministic_fallback_when_llm_plan_is_invalid(self):
+        Path("AGENTS.md").write_text("# Project\n\n## Backlog\nExisting notes.\n", encoding="utf-8")
+        response_body = {
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": '{"assessment":"none","insert_after_line":999}'}],
+            }],
+        }
+        response = self.FakeResponse(bl.OPENAI_ENDPOINT, json.dumps(response_body).encode())
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "secret"}), mock.patch.object(
+            bl, "_no_redirect_opener", return_value=self.FakeOpener(response)
+        ), contextlib.redirect_stdout(output):
+            bl.setup()
+        text = Path("AGENTS.md").read_text(encoding="utf-8")
+        self.assertEqual(
+            text,
+            "# Project\n\n## Backlog\n" + bl.BL_INSTRUCTION + "\nExisting notes.\n",
+        )
+        self.assertIn("LLM assessment unavailable", output.getvalue())
+
     def test_setup_updates_old_instruction_and_is_idempotent(self):
         old = "Use `bl` to manage the local backlog stored in `backlog.md`. Run `bl help` for available commands.\n"
         Path("AGENTS.md").write_text(old, encoding="utf-8")
@@ -506,12 +606,13 @@ class ProviderAndDocumentationTests(BacklogTestCase):
         self.assertIn("bl edit", result.stdout)
         self.assertIn("bl move", result.stdout)
 
-    def test_version_reports_major_format_release(self):
+    def test_version_matches_documented_release_and_retains_format_warning(self):
         result = self.run_bl("--version")
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.strip(), "bl 2.0.0")
+        self.assertEqual(result.stdout.strip(), f"bl {bl.VERSION}")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("Version 2.0.0 — major backlog-format change", readme)
+        self.assertIn(f"Version {bl.VERSION}", readme)
+        self.assertIn("Version 2.0.0 format change", readme)
 
     @unittest.skipUnless(sys.platform == "darwin" and shutil.which("swift"), "requires macOS Swift")
     def test_gui_available_rejects_missing_backlog(self):
